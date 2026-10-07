@@ -136,12 +136,12 @@ struct Network {
 }
 
 enum SortKey: String, CaseIterable {
-    case rssi, ssid, bssid, manufacturer, channel, band, security, beacons, seen, first
+    case rssi, ssid, bssid, manufacturer, channel, width, band, security, beacons, seen, first
 
     var title: String {
         switch self {
         case .rssi: return "RSSI"; case .ssid: return "SSID"; case .bssid: return "BSSID"; case .manufacturer: return "Manufacturer"
-        case .channel: return "Channel"; case .band: return "Band"; case .security: return "Security"; case .beacons: return "Beacons"
+        case .channel: return "Channel"; case .width: return "Width"; case .band: return "Band"; case .security: return "Security"; case .beacons: return "Beacons"
         case .seen: return "Last seen"; case .first: return "First seen"
         }
     }
@@ -157,6 +157,7 @@ enum SortKey: String, CaseIterable {
         case "mac": return .bssid
         case "vendor", "oui", "maker", "mfr", "manuf": return .manufacturer
         case "ch", "chan": return .channel
+        case "bw", "bandwidth", "mhz", "chwidth": return .width
         case "sec", "enc", "encryption", "auth": return .security
         case "count", "frames", "beacon": return .beacons
         case "last", "lastseen", "age": return .seen

@@ -32,9 +32,13 @@ main.swift          entry: options → OUI load (background) → interface → s
 Options.swift       hand-rolled arg parser + help text (kept in sync with README)
 Model.swift         Network, Band, Security, VendorSource, SortKey, Store (NSLock-guarded)
 ScanSource.swift    CoreWLAN scanForNetworks on a thread every --interval; counts sightings
-MonitorSource.swift tcpdump -I subprocess → pcap/pcapng stream parser → radiotap → 802.11 mgmt
-                    → IEParser; channel hopper thread (CWInterface.setWLANChannel), adaptive
-                    dwell; --pcap replay path uses the same parser
+MonitorSource.swift radio power-cycle to drop the association → tune to the first channel →
+                    tcpdump -I subprocess (one per band: the tap is band-locked, so the hopper
+                    closes and relaunches it at each band boundary) → pcap/pcapng stream
+                    parser → radiotap → 802.11 mgmt → IEParser; hopper thread
+                    (CWInterface.setWLANChannel), adaptive dwell; graceful stop waits for
+                    tcpdump to release monitor mode, then for auto-join; --pcap replay path
+                    uses the same parser
 IEParser.swift      IE walker: SSID, DS param, country, HT/VHT/HE/EHT (phy + width), RSN/WPA
                     → Security, WPS (manufacturer/model/device), Aironet + Aruba AP name,
                     vendor OUIs; IEParser.apply merges facts into a Network
@@ -72,6 +76,29 @@ Threads: main (TUI loop, 10 fps, differential redraw inside `\e[?2026h/l`), scan
 - **Manufacturer provenance markers** (✓ declared, none OUI, ≈ vendor IE, ? SSID) so users can
   judge confidence; JSON exposes every raw enrichment field.
 - **Adaptive dwell**: after the first sweep, quiet channels get 80 ms instead of `--dwell`.
+- **Drop the Wi-Fi link with a radio power-cycle, never `disassociate()`.** Verified on macOS
+  26.6: `setWLANChannel` returns -3903 (kA11NotSupportedErr) while associated, and `tcpdump -I`
+  delivers zero frames until the station link is gone — the tap must also be opened *after*
+  the link drops. `CWInterface.disassociate()` works but suspends macOS auto-join (like
+  "Disconnect" in the Wi-Fi menu); afterwards neither a power-cycle nor a join from a
+  terminal process (`associate(to:)`, `networksetup -setairportnetwork`, both → -3900 tmpErr,
+  SSIDs are redacted without Location permission) reconnects — only the Wi-Fi menu does. A
+  `setPower(false/true)` cycle leaves the radio unassociated with auto-join armed, tcpdump
+  grabs monitor mode in the gap, and macOS rejoins ~9 s after we release it.
+- **One tcpdump per band — the monitor tap is band-locked.** Measured on macOS 26.6 with a
+  tap held open while stepping channels: tuned 6→116→11→36→1→149, the radiotap frequencies
+  were 2437, 2437, 2462, 2462, 2412, 2412 MHz — every 5 GHz tune (20/40/80 MHz alike) was
+  accepted and reported by `wlanChannel()` but the receiver stayed on the last 2.4 GHz
+  channel. Opening the tap while tuned to 116 inverted it: 5 GHz hops followed, 2.4 GHz
+  tunes were ignored. So `start()` tunes to `hopList[0]` before launching tcpdump, and the
+  hopper does close → tune → relaunch whenever the next channel is in a different band
+  (hopList is sorted by band, so that is once per band per sweep, ~0.45 s each, included in
+  the status line's s/sweep estimate). Symptom before the fix: only 2.4 GHz rows while the
+  status line happily showed 5 GHz channels.
+- **Graceful stop** (`q`/Esc/Ctrl-C/SIGINT/SIGTERM): stop hopping → terminate tcpdump and wait
+  for it to exit (SIGKILL after 3 s) → wait up to 12 s for auto-join, power-cycle once more if
+  needed. tcpdump exiting is what takes the radio out of monitor mode; if the process dies
+  hard, tcpdump gets SIGPIPE on its next write and exits too.
 - **`tcsetattr` uses TCSANOW** — TCSAFLUSH blocked forever under a pty harness on macOS.
 - **Startup flushes stdin** and the Location wait is 1.5 s so keys typed during startup don't
   quit the TUI; a later Location grant is picked up on the next scan.
@@ -92,7 +119,7 @@ python3 tests/make_sample_pcap.py     # regenerate synthetic captures after pars
 `tests/tui_drive.py` runs the binary in a pseudo-terminal, types `KEYS` (escape sequences
 allowed, e.g. `\x1b[B`), and prints the reconstructed last frame without colours.
 
-## Status (2026-09-25)
+## Status (2026-10-07)
 
 Working and verified on the dev machine (macOS 26.6, Apple silicon, Swift 6.4 CLT):
 - Build via Makefile; `--help`, `--version`, `--lookup`, `--once`, `--json`, `--csv`.
@@ -101,13 +128,20 @@ Working and verified on the dev machine (macOS 26.6, Apple silicon, Swift 6.4 CL
   vendor-IE inference, chipset hint, SSID hint, 6 GHz HE operation, hidden SSID via probe
   response, unicode SSIDs, sorting/filtering/scrolling/keys, responsive layout, ASCII mode.
 
-**Not yet verified (needs an interactive sudo session):**
-- Monitor mode end to end: `sudo ./wifi-wanderer --monitor`. Specifically whether
-  `CWInterface.setWLANChannel` succeeds while tcpdump holds monitor mode, whether Apple's
-  tcpdump emits pcap or pcapng on stdout (both are handled), and radiotap field layout on this
-  driver. If hopping fails the status line shows "channel hop failed" and capture continues on
-  the current channel.
+- Monitor mode end to end (2026-10-07, without sudo: the dev account is in `access_bpf`):
+  power-cycle → tcpdump (Apple tcpdump 4.99.1 emits classic pcap, DLT 127, radiotap parsed
+  fine) → 38-channel hop with a tcpdump relaunch per band → 2.4 and 5 GHz beacons (29 APs on
+  ch 1/6/11/36/44/116/149 in 30 s, 5.1 s/sweep), manufacturer/security enrichment on live
+  APs → `q` quit → tcpdump gone → Wi-Fi auto-rejoined before exit.
+
+- Owner confirmed monitor mode (2.4 + 5 GHz, reconnect on quit) and the MHz column working on
+  the dev Mac (2026-10-07).
+
+**Not yet verified:**
+- Monitor mode on a 6 GHz-capable Mac (owner plans to test on another laptop): the per-band
+  tcpdump relaunch and the 6 GHz hop list are only exercised by the synthetic capture here.
 - The Location Services prompt on a terminal app that is allowed to show it (Terminal/iTerm).
+- Whether running as root (sudo) changes SSID redaction or lets `associate(to:)` succeed.
 
 ## Known limitations / ideas
 
@@ -131,3 +165,18 @@ Working and verified on the dev machine (macOS 26.6, Apple silicon, Swift 6.4 CL
 - 2026-09-25 09:40 — pty harness; sorting/filter/scroll/ASCII verified; tcsetattr hang fixed;
   startup input flush; adaptive dwell + sweep estimate in status line.
 - 2026-09-25 09:50 — README, AGENTS.md, PROGRESS.md, LICENSE; initial commit and push.
+- 2026-10-07 10:15 — Owner ran `sudo --monitor`: "channel hop failed (kA11NotSupportedErr)",
+  0 beacons. Root cause: interface still associated; CoreWLAN refuses `setWLANChannel` and
+  the monitor tap is silent while associated (reproduced with a 10 s raw tcpdump: empty pcap).
+- 2026-10-07 10:40 — First fix used `disassociate()` + explicit rejoin: capture worked but the
+  Mac never reconnected (auto-join suspended; CLI joins → tmpErr). Owner had to rejoin by hand
+  twice. Replaced with a radio power-cycle before tcpdump; auto-join reconnects in ~9 s.
+- 2026-10-07 10:55 — Graceful stop waits for tcpdump exit and for the reconnect; stderr
+  reader no longer flags tcpdump's "data link type" line as an error. Verified live.
+- 2026-10-07 11:15 — Owner: only 2.4 GHz rows although the hopper showed 5 GHz channels.
+  Measured with a second process + raw tcpdump: the radio does retune, but the monitor tap
+  only receives the band it was opened on. Fix: tune before opening, relaunch tcpdump at
+  each band change. 5 GHz APs now appear; sweep ≈ 5 s.
+- 2026-10-07 11:30 — Channel bandwidth column `MHz` made mandatory (was optional `W`), new
+  SortKey `.width` (`--sort width|bw|bandwidth|mhz`).
+- 2026-10-07 11:45 — Owner tested again: working well. Committed and pushed. Next: 6 GHz laptop.

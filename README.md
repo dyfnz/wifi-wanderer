@@ -63,8 +63,11 @@ updating table that looks and feels like a modern TUI app.
 
 - macOS 13 or newer on Apple silicon or Intel (developed on macOS 26).
 - Xcode Command Line Tools (`xcode-select --install`) to build. No SwiftPM dependencies.
-- Monitor mode needs root (`sudo`) because it uses `tcpdump -I` to put the radio in monitor
-  mode. It disconnects the Mac from Wi-Fi for the duration and reconnects afterwards.
+- Monitor mode needs root (`sudo`) — or membership of the `access_bpf` group that Wireshark's
+  ChmodBPF installs — because it uses `tcpdump -I` to put the radio in monitor mode. It drops
+  the Wi-Fi connection for the duration (macOS refuses channel changes and delivers no
+  monitor-mode frames while associated) and macOS auto-joins again when you quit with `q`,
+  `Esc` or Ctrl-C; the app waits for that before exiting.
 
 ## Install
 
@@ -101,8 +104,17 @@ wifi-wanderer --lookup 3c:22:fb         look up a MAC / OUI prefix
 Channel hopping in monitor mode dwells `--dwell` ms (default 250) on each channel. After the
 first full sweep, channels where no beacon was heard get a short 80 ms visit so the sweep
 stays quick (`--no-adaptive` turns this off). The status line shows the channel count and the
-estimated seconds per sweep. A typical Mac exposes 13 + 25 channels on 2.4/5 GHz (about 9.5 s
-for the first sweep, 3–5 s afterwards); 6 GHz-capable Macs add up to 59 more.
+estimated seconds per sweep. A typical Mac exposes 13 + 25 channels on 2.4/5 GHz (about 10 s
+for the first sweep, 4–5 s afterwards); 6 GHz-capable Macs add up to 59 more. On macOS the
+monitor tap only receives the band it was opened on, so the capture is restarted once per
+band on every sweep (that is the brief pause you may notice at the band boundary).
+
+Monitor mode and your Wi-Fi connection: macOS will not change channel while the interface is
+associated, and on recent macOS the monitor-mode tap stays silent until the station link is
+gone. Wi-Fi Wanderer therefore power-cycles the radio before starting the capture (the notice
+line says so) and, on quit, waits for macOS auto-join to reconnect you — about 10 s. It
+deliberately avoids CoreWLAN's `disassociate()`, which suspends auto-join the same way
+"Disconnect" in the Wi-Fi menu does, after which only the Wi-Fi menu can rejoin.
 
 ### Location Services (scan mode)
 
@@ -131,8 +143,8 @@ CAPTURE
       --no-location        Do not request Location Services authorization
 
 DISPLAY
-  -s, --sort <key>         rssi (default) | ssid | bssid | manufacturer | channel | band |
-                           security | beacons | seen | first
+  -s, --sort <key>         rssi (default) | ssid | bssid | manufacturer | channel | width |
+                           band | security | beacons | seen | first
   -r, --reverse            Reverse the sort direction
   -f, --filter <text>      Only SSIDs containing <text> (case-insensitive)
       --no-hidden          Hide networks that do not broadcast an SSID
@@ -168,7 +180,7 @@ OTHER
 |---|---|
 | `q`, `Esc`, `Ctrl-C` | Quit (prints JSON/CSV afterwards if `--json`/`--csv` was given) |
 | `s` / `S` | Next / previous sort column |
-| `1`–`9` | Sort by RSSI, SSID, BSSID, Manufacturer, Channel, Band, Security, Beacons, Last seen |
+| `1`–`9`, `0` | Sort by RSSI, SSID, BSSID, Manufacturer, Channel, Band, Security, Beacons, Last seen; `0` = channel width |
 | `r` | Reverse sort direction |
 | `↑` `↓` `PgUp` `PgDn` `Home` `End` (or `j` `k` `g` `G`) | Scroll |
 | `p` or `Space` | Pause / resume capture |
@@ -185,7 +197,8 @@ OTHER
 | BSSID | Access point MAC address |
 | Manufacturer | Best attribution with a provenance mark (`✓` declared, `≈` vendor IE, `?` SSID hint, none = OUI registry) |
 | Device | WPS model name/number, device name, or Cisco/Aruba AP name; chipset hint when nothing else |
-| Ch / W | Primary channel and channel width in MHz |
+| Ch | Primary channel |
+| MHz | Channel bandwidth (20/40/80/160 MHz from the HT/VHT/HE/EHT operation elements; `—` when the AP does not say) |
 | Band | 2.4, 5 or 6 GHz |
 | RSSI | Signal bars and dBm, coloured from green (≥ −55) to red (< −85) |
 | Security | Open, WEP, WPA, WPA/2, WPA2, WPA2/3 (transition), WPA3, WPA2-Ent, WPA3-Ent, OWE |

@@ -64,6 +64,7 @@ enum Render {
                 r = x != y ? x < y : a.rssi > b.rssi
             case .channel: r = a.channel != b.channel ? a.channel < b.channel : a.rssi > b.rssi
             case .band: r = a.band != b.band ? a.band < b.band : (a.channel != b.channel ? a.channel < b.channel : a.rssi > b.rssi)
+            case .width: r = a.widthMHz != b.widthMHz ? a.widthMHz < b.widthMHz : (a.channel != b.channel ? a.channel < b.channel : a.rssi > b.rssi)
             case .security: r = a.security != b.security ? a.security < b.security : a.rssi > b.rssi
             case .beacons: r = a.beacons != b.beacons ? a.beacons < b.beacons : a.rssi < b.rssi
             case .seen: r = a.lastSeen != b.lastSeen ? a.lastSeen < b.lastSeen : a.rssi < b.rssi
@@ -82,6 +83,7 @@ enum Render {
         case .manufacturer: return a.manufacturer.name.lowercased() == b.manufacturer.name.lowercased() && a.rssi == b.rssi
         case .channel: return a.channel == b.channel && a.rssi == b.rssi
         case .band: return a.band == b.band && a.channel == b.channel && a.rssi == b.rssi
+        case .width: return a.widthMHz == b.widthMHz && a.channel == b.channel && a.rssi == b.rssi
         case .security: return a.security == b.security && a.rssi == b.rssi
         case .beacons: return a.beacons == b.beacons && a.rssi == b.rssi
         case .seen: return a.lastSeen == b.lastSeen && a.rssi == b.rssi
@@ -130,7 +132,7 @@ enum Render {
             Column(title: "Manufacturer", key: .manufacturer, width: 22, align: .left, optional: 0),
             Column(title: "Device", key: nil, width: 20, align: .left, optional: detail ? 2 : 99),
             Column(title: "Ch", key: .channel, width: 3, align: .right, optional: 0),
-            Column(title: "W", key: nil, width: 3, align: .right, optional: 3),
+            Column(title: "MHz", key: .width, width: 4, align: .right, optional: 0),
             Column(title: "Band", key: .band, width: 4, align: .left, optional: 0),
             Column(title: "RSSI", key: .rssi, width: 9, align: .left, optional: 0),
             Column(title: "Security", key: .security, width: 8, align: .left, optional: 0),
@@ -312,7 +314,7 @@ enum Render {
                     let d = n.device ?? (n.chipsetVendors.isEmpty ? "" : n.chipsetVendors.joined(separator: "/") + " chip")
                     cell = Style.paint(TextWidth.pad(d, c.width, .left), n.device != nil ? Style.text : Style.dim)
                 case "Ch": cell = Style.paint(TextWidth.pad(n.channel == 0 ? "?" : String(n.channel), c.width, .right), Style.text)
-                case "W": cell = Style.paint(TextWidth.pad(n.widthMHz == 0 ? "" : String(n.widthMHz), c.width, .right), Style.muted)
+                case "MHz": cell = Style.paint(TextWidth.pad(n.widthMHz == 0 ? "—" : String(n.widthMHz), c.width, .right), Style.muted)
                 case "Band": cell = Style.paint(TextWidth.pad(n.band.label, c.width, .left), bandColor(n.band), bold: true)
                 case "RSSI":
                     let t = rssiBar(n.rssi) + " " + TextWidth.pad(String(n.rssi), 4, .right)
@@ -383,7 +385,7 @@ enum Render {
                     cell = Style.paint(TextWidth.pad(marker.isEmpty ? m.name : m.name + " " + marker, c.width), m.source == .declared ? Style.ok : (m.source == .oui ? Style.text : Style.muted))
                 case "Device": cell = Style.paint(TextWidth.pad(n.device ?? "", c.width), Style.text)
                 case "Ch": cell = TextWidth.pad(String(n.channel), c.width, .right)
-                case "W": cell = Style.paint(TextWidth.pad(n.widthMHz == 0 ? "" : String(n.widthMHz), c.width, .right), Style.muted)
+                case "MHz": cell = Style.paint(TextWidth.pad(n.widthMHz == 0 ? "—" : String(n.widthMHz), c.width, .right), Style.muted)
                 case "Band": cell = Style.paint(TextWidth.pad(n.band.label, c.width), bandColor(n.band), bold: true)
                 case "RSSI": cell = Style.paint(TextWidth.pad(rssiBar(n.rssi) + " " + TextWidth.pad(String(n.rssi), 4, .right), c.width), rssiColor(n.rssi))
                 case "Security": cell = Style.paint(TextWidth.pad(n.security.label, c.width), securityColor(n.security))

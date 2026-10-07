@@ -205,6 +205,7 @@ while true {
         case .char("7"): view.sort = .security; view.reverse = false
         case .char("8"): view.sort = .beacons; view.reverse = false
         case .char("9"): view.sort = .seen; view.reverse = false
+        case .char("0"): view.sort = .width; view.reverse = false
         default: break
         }
     }

@@ -13,7 +13,10 @@ final class MonitorSource: Source {
     private(set) var hopIndex = 0
     var hopCount: Int { hopList.count }
     /// Estimated seconds for one full sweep with the current per-channel dwell times.
-    var sweepSeconds: Double { hopList.indices.reduce(0) { $0 + dwellFor(index: $1) } }
+    var sweepSeconds: Double {
+        hopList.indices.reduce(0) { $0 + dwellFor(index: $1) } + (bandCount > 1 ? Double(bandCount) * 0.45 : 0)
+    }
+    private let bandCount: Int
     private let adaptive: Bool
     private var channelHeard: [Int: Int] = [:]   // channel number → beacons heard on it
     private var sweeps = 0
@@ -26,6 +29,8 @@ final class MonitorSource: Source {
     private let hopList: [CWChannel]
     private var process: Process?
     private var running = false
+    private var disassociated = false    // we dropped the Wi-Fi association for capture
+    private var hopperDone = true
     private var buffer = Data()
     private var pcap: PcapState = .header
     private var linkType: Int = 127
@@ -52,6 +57,7 @@ final class MonitorSource: Source {
             let ba = WiFi.band(of: a), bb = WiFi.band(of: b)
             return ba != bb ? ba < bb : a.channelNumber < b.channelNumber
         }
+        bandCount = Set(hopList.map(WiFi.band)).count
     }
 
     static func hasCapturePrivileges() -> Bool {
@@ -62,6 +68,23 @@ final class MonitorSource: Source {
     func start() {
         running = true
         if let path = pcapPath { startReplay(path); return }
+        guard !hopList.isEmpty else { store.setError("no channels to hop (check --band/--channels)"); return }
+        disconnectForCapture()
+        // The monitor tap is locked to the band the radio is on when tcpdump opens the device
+        // (verified on macOS 26: 5 GHz tunes are accepted and reported, but a tap opened on
+        // 2.4 GHz keeps receiving 2.4 GHz, and vice versa). So tune to the first channel
+        // before opening the tap, and reopen it at every band change (see hopLoop).
+        tune(hopList[0])
+        launchCapture()
+        hopperDone = false
+        let hopper = Thread { [self] in hopLoop() }
+        hopper.name = "hopper"; hopper.start()
+    }
+
+    private var readerDone = true
+
+    /// Launch tcpdump on the radio's current band and start the pcap/stderr reader threads.
+    private func launchCapture() {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: tcpdumpPath)
         p.arguments = ["-I", "-i", interfaceName, "-U", "-w", "-", "-s", "0", "-y", "IEEE802_11_RADIO",
@@ -69,15 +92,19 @@ final class MonitorSource: Source {
         let out = Pipe(), err = Pipe()
         p.standardOutput = out; p.standardError = err
         p.terminationHandler = { [weak self] proc in
-            guard let self = self, self.running else { return }
+            // Only an unexpected exit of the tcpdump we currently own is an error.
+            guard let self = self, self.running, proc === self.process else { return }
             self.store.setError("tcpdump exited (status \(proc.terminationStatus)); no capture")
         }
+        buffer.removeAll(); pcap = .header; pcapng = false   // a fresh stream starts with a new header
         do { try p.run() } catch {
             store.setError("cannot start tcpdump: \(error.localizedDescription)")
             return
         }
         process = p
+        readerDone = false
         let reader = Thread { [self] in
+            defer { readerDone = true }
             let fh = out.fileHandleForReading
             while running {
                 let d = fh.availableData
@@ -93,15 +120,28 @@ final class MonitorSource: Source {
                 if d.isEmpty { break }
                 let s = String(decoding: d, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
                 if s.isEmpty { continue }
-                if s.lowercased().contains("listening on") { store.setNote(nil) }
-                else if s.lowercased().contains("tcpdump:") || s.lowercased().contains("error") || s.lowercased().contains("permission") {
+                let low = s.lowercased()
+                if low.contains("listening on") || low.contains("data link type") { continue }   // informational
+                if low.contains("tcpdump:") || low.contains("error") || low.contains("permission") {
                     store.setError(s.components(separatedBy: "\n").first)
                 }
             }
         }
         errReader.name = "tcpdump-stderr"; errReader.start()
-        let hopper = Thread { [self] in hopLoop() }
-        hopper.name = "hopper"; hopper.start()
+    }
+
+    /// Stop the tcpdump we own (an expected exit, not reported) and wait for it and its reader.
+    private func closeCapture() {
+        guard let p = process else { return }
+        process = nil
+        if p.isRunning { p.terminate() }
+        if !waitUntil(timeout: 3, { !p.isRunning }) { kill(p.processIdentifier, SIGKILL); _ = waitUntil(timeout: 1) { !p.isRunning } }
+        _ = waitUntil(timeout: 1) { readerDone }
+    }
+
+    @discardableResult
+    private func tune(_ ch: CWChannel) -> Error? {
+        do { try iface?.setWLANChannel(ch); currentChannel = ch.channelNumber; return nil } catch { return error }
     }
 
     /// Replay a saved capture, in chunks so the live view animates.
@@ -123,10 +163,67 @@ final class MonitorSource: Source {
         t.name = "pcap-replay"; t.start()
     }
 
+    /// Graceful shutdown: stop hopping, let tcpdump exit (which takes the radio out of monitor
+    /// mode), then nudge macOS to re-join the network we disconnected from.
     func stop() {
         running = false
-        if let p = process, p.isRunning { p.terminate() }
-        process = nil
+        waitUntil(timeout: 3) { hopperDone }
+        closeCapture()
+        restoreRadio()
+    }
+
+    @discardableResult
+    private func waitUntil(timeout: TimeInterval, _ cond: () -> Bool) -> Bool {
+        let end = Date().addingTimeInterval(timeout)
+        while !cond() { if Date() >= end { return false }; Thread.sleep(forTimeInterval: 0.03) }
+        return true
+    }
+
+    // MARK: radio association
+
+    /// CoreWLAN hides SSID/BSSID without Location permission, but RSSI and TX rate are only
+    /// non-zero while associated, so they are a reliable association probe.
+    private var isAssociated: Bool {
+        guard let i = iface else { return false }
+        return i.rssiValue() != 0 || i.transmitRate() > 0
+    }
+
+    /// Break the association: `setWLANChannel` is refused (kA11NotSupportedErr) while associated,
+    /// and this driver delivers no monitor-mode frames at all until the station link is gone.
+    /// We power-cycle the radio rather than call `disassociate()`: an explicit disassociate
+    /// suspends macOS auto-join (like "Disconnect" in the Wi-Fi menu) until the user re-joins
+    /// by hand, and a join from a terminal process is refused (tmpErr; SSIDs are redacted
+    /// without Location permission). After a power-cycle the radio comes up unassociated and
+    /// auto-join stays armed, so macOS reconnects by itself once we release monitor mode.
+    private func disconnectForCapture() {
+        guard let i = iface, isAssociated else { return }
+        do {
+            try i.setPower(false)
+            _ = waitUntil(timeout: 2) { !i.powerOn() }
+            try i.setPower(true)
+            _ = waitUntil(timeout: 3) { i.powerOn() }
+            disassociated = true
+            store.setNote("Wi-Fi link dropped for monitor capture — macOS reconnects when you quit (q / esc)")
+        } catch {
+            store.setError("could not drop the Wi-Fi link (\(error.localizedDescription)); hopping will fail while associated")
+        }
+    }
+
+    /// After tcpdump has released monitor mode, wait for auto-join to reconnect; cycle the
+    /// radio once more if it does not.
+    private func restoreRadio() {
+        guard disassociated, iface != nil else { return }
+        disassociated = false
+        let err = FileHandle.standardError
+        if isAssociated { return }
+        err.write(Data("Waiting for Wi-Fi on \(interfaceName) to reconnect…\n".utf8))
+        if waitUntil(timeout: 12, { isAssociated }) { err.write(Data("Wi-Fi reconnected.\n".utf8)); return }
+        if let i = iface {
+            try? i.setPower(false); _ = waitUntil(timeout: 2) { !i.powerOn() }
+            try? i.setPower(true)
+            if waitUntil(timeout: 15, { isAssociated }) { err.write(Data("Wi-Fi reconnected.\n".utf8)); return }
+        }
+        err.write(Data("Wi-Fi did not reconnect automatically; pick your network from the Wi-Fi menu.\n".utf8))
     }
 
     // MARK: channel hopping
@@ -139,22 +236,33 @@ final class MonitorSource: Source {
     }
 
     private func hopLoop() {
-        guard !hopList.isEmpty else { store.setError("no channels to hop (check --band/--channels)"); return }
-        Thread.sleep(forTimeInterval: 0.5)   // let tcpdump take the interface first
+        defer { hopperDone = true }
+        Thread.sleep(forTimeInterval: 0.3)   // let the tap come up
         var failures = 0
+        var band = WiFi.band(of: hopList[0])
         while running {
             if paused { Thread.sleep(forTimeInterval: 0.1); continue }
+            // macOS auto-join re-associating mid-run would silence the tap; we cannot
+            // power-cycle under a live tcpdump, so report it (never seen in testing: the
+            // constant channel changes keep airportd's join attempts from completing).
+            if hopIndex == 0 && isAssociated { store.setError("Wi-Fi re-joined during capture — quit (q) and start again") }
             let ch = hopList[hopIndex % hopList.count]
-            do {
-                try iface?.setWLANChannel(ch)
-                currentChannel = ch.channelNumber
-                if failures > 0 { failures = 0; store.setError(nil) }
-            } catch {
+            let b = WiFi.band(of: ch)
+            if b != band {
+                // Band change: the tap only ever receives the band it was opened on.
+                closeCapture()
+                tune(ch)
+                launchCapture()
+                band = b
+                Thread.sleep(forTimeInterval: 0.25)
+                if !running { break }
+            }
+            if let error = tune(ch) {
                 failures += 1
                 if failures == 3 {
                     store.setError("channel hop failed (\(error.localizedDescription)) — capturing on the current channel only")
                 }
-            }
+            } else if failures > 0 { failures = 0; store.setError(nil) }
             Thread.sleep(forTimeInterval: dwellFor(index: hopIndex))
             hopIndex = (hopIndex + 1) % hopList.count
             if hopIndex == 0 { sweeps += 1; store.bumpRound() }

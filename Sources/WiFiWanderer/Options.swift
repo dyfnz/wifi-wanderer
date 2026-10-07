@@ -144,8 +144,8 @@ struct Options {
           --no-location        Do not request Location Services authorization
 
     DISPLAY
-      -s, --sort <key>         rssi (default) | ssid | bssid | manufacturer | channel | band |
-                               security | beacons | seen | first
+      -s, --sort <key>         rssi (default) | ssid | bssid | manufacturer | channel | width |
+                               band | security | beacons | seen | first
       -r, --reverse            Reverse the sort direction
       -f, --filter <text>      Only SSIDs containing <text> (case-insensitive)
           --no-hidden          Hide networks that do not broadcast an SSID
@@ -179,6 +179,7 @@ struct Options {
       ↑ ↓ PgUp PgDn     scroll      p       pause / resume                  c  reset counters
       h  toggle hidden SSIDs        m       toggle manufacturer detail (Device / source)
       /  set SSID filter (type, Enter)      x  clear filter
+      1-9 / 0           sort by column (0 = channel width)
 
     NOTES
       macOS hides SSID and BSSID from apps without Location Services access. On first run you
